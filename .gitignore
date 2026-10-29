@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+
+# Rebuilt by tools/setup_xfoil.sh
+tools/xfoil
+tools/libnofpe.so
+tools/*.deb
+
+# Per-run progress logs (the .json next to each holds the full record)
+results/runs/*.log
