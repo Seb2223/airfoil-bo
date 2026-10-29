@@ -30,3 +30,5 @@ In the loop: model predictions at each proposed design vs the XFoil result.
 | GP + EI, failures imputed | 47% | 78% | -2.0 | - | - |
 | Bootstrapped ensemble + EI, failure classifier | 54% | 91% | -11.5 | 72.9% | 64.8% |
 | Plain ensemble + EI, failure classifier | 41% | 73% | -7.5 | 51.9% | 45.8% |
+| GP + EI, failure classifier, trust region | 48% | 78% | -0.4 | 97.4% | 97.9% |
+| Bootstrapped ensemble + EI, failure classifier, trust region | 55% | 91% | +0.8 | 91.9% | 91.1% |

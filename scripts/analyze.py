@@ -21,15 +21,20 @@ sys.path.insert(0, str(ROOT))
 from airfoil_bo import geometry, problem, xfoil  # noqa: E402
 
 RESULTS = ROOT / "results"
-# Colour follows the entity (fixed slots: 1 blue, 2 orange, 3 aqua, 4 yellow);
-# dict order is only the legend order.
-METHODS = {
-    "gp_ei": ("GP + EI, failure classifier", "#2a78d6"),
-    "gp_ei_impute": ("GP + EI, failures imputed", "#eb6834"),
-    "random": ("Random search", "#1baf7a"),
-    "ens_ei": ("Bootstrapped ensemble + EI, failure classifier", "#eda100"),
-    "ens_ei_plain": ("Plain ensemble + EI, failure classifier", "#e87ba4"),
+# Colour follows the surrogate (fixed slots: 1 blue, 2 orange, 3 aqua, 4 yellow,
+# 5 magenta); a dashed line marks the trust-region variant of the same method.
+# Dict order is only the legend order.
+METHODS = {  # name -> (label, colour, trust region)
+    "gp_ei": ("GP + EI, failure classifier", "#2a78d6", False),
+    "gp_ei_impute": ("GP + EI, failures imputed", "#eb6834", False),
+    "random": ("Random search", "#1baf7a", False),
+    "ens_ei": ("Bootstrapped ensemble + EI, failure classifier", "#eda100", False),
+    "ens_ei_plain": ("Plain ensemble + EI, failure classifier", "#e87ba4", False),
+    "gp_ei_tr": ("GP + EI, failure classifier, trust region", "#2a78d6", True),
+    "ens_ei_tr": ("Bootstrapped ensemble + EI, failure classifier, trust region", "#eda100", True),
 }
+MAIN_FIGURE = ["gp_ei", "gp_ei_impute", "random", "ens_ei", "ens_ei_plain"]
+TR_FIGURE = ["gp_ei", "gp_ei_tr", "ens_ei", "ens_ei_tr", "random"]
 CALIBRATION_MODELS = {  # static study: the regression models behind gp_ei / ens_ei, plus the plain recipe
     "GP": "#2a78d6",
     "Deep ensemble (bootstrapped)": "#eda100",
@@ -66,6 +71,47 @@ def first_reaching(curve, level):
     return hit[0] + 1 if len(hit) else None
 
 
+def corner_share(runs_of_method, n_init=10):
+    """Share of BO proposals with at least 5 of the 7 parameters at a bound of the unit cube."""
+    props = [r for run in runs_of_method for r in run["records"][n_init:]]
+    at_bound = [np.sum(np.minimum(np.array(r["u"]), 1 - np.array(r["u"])) < 1e-3) for r in props]
+    return float(np.mean(np.array(at_bound) >= 5)) if props else float("nan")
+
+
+def plot_convergence(curves, methods, title, path, ref, naca, best_known, labels=None,
+                     subtitle="Median over seeds, band = interquartile range. 12%-thick airfoil, Re = 1e6, "
+                              "L/D averaged at CL = 0.4, 0.6, 0.8."):
+    fig, ax = plt.subplots(figsize=(8, 4.8), layout="constrained")
+    budget = max(curves[m].shape[1] for m in methods if m in curves)
+    x = np.arange(1, budget + 1)
+    for m in methods:
+        if m not in curves:
+            continue
+        label, color, dashed = METHODS[m]
+        label = (labels or {}).get(m, label)
+        c = curves[m]
+        med = np.nanmedian(c, axis=0)
+        lo, hi = np.nanpercentile(c, [25, 75], axis=0)
+        ax.fill_between(x, lo, hi, color=color, alpha=0.12, linewidth=0)
+        ax.plot(x, med, color=color, linewidth=2, linestyle=(0, (5, 2)) if dashed else "-",
+                solid_capstyle="round", label=f"{label} ({len(c)} seeds)")
+    for level, text in [(ref["best"]["ld"] if ref else None, f"Differential evolution, {ref['n_evals'] if ref else 0:,} sims"),
+                        (naca, "NACA 4412")]:
+        if level:
+            ax.axhline(level, color=MUTED, linewidth=1, zorder=0)
+            ax.text(budget, level, text, color=INK2, fontsize=9, ha="right", va="bottom")
+    ax.set_xlim(1, budget)
+    lows = [np.nanpercentile(curves[m][:, 9], 25) for m in methods if m in curves]
+    ax.set_ylim(min(lows) - 2, best_known + 3)
+    ax.set_xlabel("XFoil simulations used")
+    ax.set_ylabel("Best mean L/D found so far")
+    ax.set_title(title, pad=22)
+    ax.text(0, 1.015, subtitle, transform=ax.transAxes, color=INK2, fontsize=9, va="bottom")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=2, fontsize=9)
+    fig.savefig(path, dpi=160)
+    plt.close(fig)
+
+
 def main():
     runs = load_runs()
     ref = json.loads((RESULTS / "reference_de.json").read_text()) if (RESULTS / "reference_de.json").exists() else None
@@ -80,9 +126,10 @@ def main():
     # ---- summary table -------------------------------------------------------
     random_final = np.nanmedian(curves["random"][:, -1]) if "random" in curves else None
     lines = ["| Method | Median best L/D after 20 / 50 / 100 sims | Median gap to best known at 100 sims "
-             f"| Sims to match random search's 100-sim median ({random_final:.1f}) | Failed sims | Time per proposal |",
-             "|---|---|---|---|---|---|"]
-    for m, (label, _) in METHODS.items():
+             f"| Sims to match random search's 100-sim median ({random_final:.1f}) | Failed sims "
+             "| Proposals at a corner | Time per proposal |",
+             "|---|---|---|---|---|---|---|"]
+    for m, (label, _, _) in METHODS.items():
         if m not in curves:
             continue
         c = curves[m]
@@ -94,8 +141,9 @@ def main():
         recs = [rec for run in runs[m] for rec in run["records"]]
         fail = np.mean([not rec["ok"] for rec in recs])
         t_prop = np.mean([rec["t_propose"] for rec in recs if rec["t_propose"] > 0] or [0])
+        corners = "-" if m == "random" else f"{corner_share(runs[m]):.0%}"
         lines.append(f"| {label} | {at} | {gap:.1f} ({gap / best_known:.1%}) | {match_str} "
-                     f"| {fail:.0%} | {t_prop:.1f} s |")
+                     f"| {fail:.0%} | {corners} | {t_prop:.1f} s |")
     finals = {m: c[:, -1] for m, c in curves.items()}
     lines += ["", "Final best L/D, one-sided Mann-Whitney U (row better than column):", "",
               "| | p |", "|---|---|"]
@@ -113,34 +161,16 @@ def main():
         print(f"{name}: L/D {b['ld']:.1f}")
     (RESULTS / "summary.md").write_text(table + "\n")
 
-    # ---- figure 1: convergence --------------------------------------------------
-    fig, ax = plt.subplots(figsize=(8, 4.8), layout="constrained")
-    budget = max(c.shape[1] for c in curves.values())
-    x = np.arange(1, budget + 1)
-    for m, (label, color) in METHODS.items():
-        if m not in curves:
-            continue
-        c = curves[m]
-        med = np.nanmedian(c, axis=0)
-        lo, hi = np.nanpercentile(c, [25, 75], axis=0)
-        ax.fill_between(x, lo, hi, color=color, alpha=0.12, linewidth=0)
-        ax.plot(x, med, color=color, linewidth=2, solid_capstyle="round", label=f"{label} ({len(c)} seeds)")
-    for level, text in [(ref["best"]["ld"] if ref else None, f"Differential evolution, {ref['n_evals'] if ref else 0:,} sims"),
-                        (naca, "NACA 4412")]:
-        if level:
-            ax.axhline(level, color=MUTED, linewidth=1, zorder=0)
-            ax.text(budget, level, text, color=INK2, fontsize=9, ha="right", va="bottom")
-    ax.set_xlim(1, budget)
-    lows = [np.nanpercentile(c[:, 9], 25) for c in curves.values()]
-    ax.set_ylim(min(lows) - 2, best_known + 3)
-    ax.set_xlabel("XFoil simulations used")
-    ax.set_ylabel("Best mean L/D found so far")
-    ax.set_title("GP-based BO beats random search; ensemble-based BO does not", pad=22)
-    ax.text(0, 1.015, "Median over seeds, band = interquartile range. 12%-thick airfoil, Re = 1e6, "
-            "L/D averaged at CL = 0.4, 0.6, 0.8.", transform=ax.transAxes, color=INK2, fontsize=9, va="bottom")
-    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=2, fontsize=9)
-    fig.savefig(RESULTS / "convergence.png", dpi=160)
-    plt.close(fig)
+    # ---- figure 1: convergence; figure 4: trust regions ---------------------------
+    plot_convergence(curves, MAIN_FIGURE, "GP-based BO beats random search; ensemble-based BO does not",
+                     RESULTS / "convergence.png", ref, naca, best_known)
+    if any(m in curves for m in ("gp_ei_tr", "ens_ei_tr")):
+        plot_convergence(
+            curves, TR_FIGURE, "A trust region rescues the ensemble, but the GP still wins",
+            RESULTS / "trust_region.png", ref, naca, best_known,
+            labels={"gp_ei": "GP, whole space", "gp_ei_tr": "GP, trust region",
+                    "ens_ei": "Bootstrapped ensemble, whole space", "ens_ei_tr": "Bootstrapped ensemble, trust region"},
+            subtitle="All BO methods: EI + failure classifier. Median over seeds, band = interquartile range.")
 
     # ---- figure 2: best shape vs NACA 4412 ---------------------------------------
     shapes = [(f"Best found: {METHODS[best_m][0]} (L/D {best_rec['ld']:.1f})",
@@ -240,6 +270,8 @@ def plot_calibration(cal):
     short = {"gp_ei": "GP, classifier", "gp_ei_impute": "GP, imputed",
              "ens_ei": "Bootstrapped ensemble", "ens_ei_plain": "Plain ensemble"}
     for m, row in loop.items():
+        if m not in short:  # trust-region variants are in results/calibration.md only
+            continue
         ax.plot(levels, row["coverage"], color=METHODS[m][1], linewidth=2, marker="o", markersize=5,
                 markeredgecolor=SURFACE, markeredgewidth=1.5, label=short.get(m, METHODS[m][0]))
     ax.set_xlim(0, 1)

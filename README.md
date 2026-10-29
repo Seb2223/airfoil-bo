@@ -29,6 +29,7 @@ honest uncertainty actually finds better airfoils.
 | `gp_ei_impute` | GP | Scored as the worst L/D seen so far, a common shortcut. |
 | `ens_ei` | Deep ensemble of 5 MLPs, each trained on a bootstrap resample | GP classifier |
 | `ens_ei_plain` | Deep ensemble with the plain recipe (no bootstrap) | GP classifier |
+| `gp_ei_tr`, `ens_ei_tr` | As `gp_ei` / `ens_ei`, but the acquisition is optimised only inside a TuRBO-style trust region around the best design | GP classifier |
 | `random` | — | — |
 | `scripts/reference.py` | Differential evolution with 2,870 simulations, the brute-force "best known" reference | |
 
@@ -47,6 +48,7 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 ```bash
 .venv/bin/python scripts/benchmark.py --seeds 30                          # ~2.5 h on 12 cores
 .venv/bin/python scripts/benchmark.py --methods ens_ei_plain --seeds 10   # ~25 min
+.venv/bin/python scripts/benchmark.py --methods gp_ei_tr ens_ei_tr        # ~1.5 h
 .venv/bin/python scripts/reference.py                                     # ~10 min
 .venv/bin/python scripts/dataset.py --seed 1000 --out results/data/train_pool.json
 .venv/bin/python scripts/dataset.py --seed 2000 --out results/data/test.json
@@ -153,19 +155,60 @@ still optimised worst. What decides it is behaviour away from the data:
   90% success.
 
 Calibration is necessary but not sufficient. How the model extrapolates
-matters as much as how its errors are distributed.
+matters as much as how its errors are distributed. The trust-region
+experiment below tests this directly.
+
+### Trust regions: removing the extrapolation
+
+If corner-seeking is what sinks the ensemble, then forbidding it should
+help. The trust-region variants keep everything else identical (same EI,
+same classifier, same budget) and only restrict where the acquisition is
+optimised: a box around the best design so far. As in TuRBO-1:
+
+- **Size:** the box starts at 0.8 of the unit cube per side. It doubles
+  after 3 improvements in a row and halves after 7 misses in a row.
+- **Shape:** for the GP, the box is stretched per parameter by the
+  model's length scales. The ensemble has none, so its box is a cube.
+- **Collapse:** if the box shrinks below 0.5⁷, it re-expands around the
+  incumbent rather than restarting globally.
+
+![Trust regions](results/trust_region.png)
+
+| Method (30 seeds each) | Median best L/D at 100 sims | Sims to match random search's 100-sim median | Failed sims | Proposals at a corner | Median (actual − predicted) L/D in the loop |
+|---|---|---|---|---|---|
+| GP, whole space | 113.2 | 22 | 6% | 3% | −1.7 |
+| GP, trust region | **114.2** | 24 | 4% | 1% | −0.4 |
+| Bootstrapped ensemble, whole space | 103.1 | not reached | 34% | 86% | −11.5 |
+| Bootstrapped ensemble, trust region | 110.1 | 50 | 10% | 6% | +0.8 |
+| Random search | 105.2 | - | 18% | - | - |
+
+- **The trust region rescues the ensemble.** Its median rises from
+  103.1 to 110.1 (p ≈ 10⁻⁶), and it now beats random search
+  (p < 10⁻⁴). The mechanism is confirmed: corner proposals drop from 86%
+  to 6%, and its in-loop optimism vanishes (−11.5 → +0.8 L/D), with 90%
+  intervals that hold 91%.
+- **The GP still wins.** The GP with a trust region beats the ensemble
+  with a trust region by 4 L/D (p = 3·10⁻⁶) and needs half as many
+  simulations to match random search. With the extrapolation problem
+  removed, what's left is the GP's lower prediction error from 50 points
+  up (see the static table).
+- **For the GP, the trust region is a small, free improvement.** It adds
+  1 L/D (p = 0.13 vs the whole-space GP, so not significant) and makes
+  proposals faster (3.7 s vs 5.4 s), probably because optimising the
+  acquisition over a smaller box converges sooner. It also produced the single best design of any run
+  (L/D 117.3, within 0.7% of the differential-evolution optimum).
 
 ### The best airfoil
 
 ![Best airfoil](results/best_airfoil.png)
 
-The best shape found by any BO run (L/D 117.2) and the
-differential-evolution optimum (118.1) are nearly the same laminar-flow
-design:
+The best shape found by any BO run (L/D 117.3, GP with trust region) and
+the differential-evolution optimum (118.1) are nearly the same
+laminar-flow design:
 
 | | Max thickness at | Max camber |
 |---|---|---|
-| Best BO run | 41% chord | 3.3% at 57% chord |
+| Best BO run | 40% chord | 3.3% at 56% chord |
 | Differential evolution | 41% chord | 3.5% at 56% chord |
 | NACA 4412 (for comparison) | 30% chord | 4% at 40% chord |
 
@@ -207,27 +250,35 @@ bucket placed just above CL 0.8.
   gain.
 - **XFoil is a viscous–inviscid panel method.** Drag near stall is
   unreliable.
-- **The ensemble result covers this setup only:** 7 dimensions, ≤100
-  points, EI over the whole box, no trust region. Ensembles are known to
-  do better with more data or with local search; see next steps.
+- **The ensemble results cover this setup only:** 7 dimensions and ≤100
+  points. Ensembles may catch up with more data or in higher dimensions,
+  where GPs struggle.
+- **The trust region is TuRBO-1's box logic only.** It keeps EI with the
+  classifier instead of TuRBO's Thompson sampling, and it re-expands
+  instead of restarting, so that the comparison isolates the effect of
+  the search region.
 
 ## Next steps
 
-1. **Trust regions (TuRBO):** optimise the acquisition only inside a box
-   around the incumbent. This removes the corner-seeking directly and is
-   the fair way to give ensembles a second chance. Run the GPs with the
-   same change.
-2. **Fully Bayesian GP hyperparameters** (MCMC / SAAS) to fix the GP's
+1. **Fully Bayesian GP hyperparameters** (MCMC / SAAS) to fix the GP's
    overconfidence at small n, then check whether that helps optimisation.
-3. **Thompson sampling and batch qLogEI:** propose 12 designs per step
-   and compare wall-clock time rather than simulation count.
-4. **A harder, robust objective:** average over Ncrit 5 and 9, and use
-   12–14 shape parameters, where random search should fall much further
-   behind.
-5. **Multi-fidelity:** NeuralFoil (milliseconds) as the cheap source and
+2. **Full TuRBO:** Thompson sampling inside the trust region and batch
+   proposals (12 designs per step, one per core). Compare wall-clock time
+   rather than simulation count.
+3. **A harder, robust objective:** average over Ncrit 5 and 9, and use
+   12–14 shape parameters. Random search should fall much further behind
+   there, and it's where trust regions usually matter most.
+4. **Multi-fidelity:** NeuralFoil (milliseconds) as the cheap source and
    XFoil as the accurate one.
 
 ## Changes since the first version
+
+**Third round:** added the trust-region variants (`TrustRegion` in
+`airfoil_bo/bo.py`; `gp_ei_tr` and `ens_ei_tr`, 30 seeds each). Added a
+"Proposals at a corner" column to `results/summary.md` and a new figure,
+`results/trust_region.png`.
+
+**Second round:**
 
 - **Solver:** both sweep directions now warm-start from α = 0.
 - **Benchmark:** 30 seeds instead of 10, plus the two ensemble methods.

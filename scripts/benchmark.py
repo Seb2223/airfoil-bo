@@ -16,7 +16,7 @@ sys.path.insert(0, str(ROOT))
 RUNS = ROOT / "results" / "runs"
 # Rough relative cost per run; the slowest jobs are submitted first so the
 # pool doesn't finish with a long tail of slow runs on a few cores.
-COST = {"ens_ei": 4, "gp_ei": 3, "gp_ei_impute": 2, "random": 1}
+COST = {"ens_ei": 4, "ens_ei_plain": 4, "ens_ei_tr": 4, "gp_ei": 3, "gp_ei_tr": 3, "gp_ei_impute": 2, "random": 1}
 
 
 def job(method: str, seed: int, budget: int, n_init: int) -> str:
