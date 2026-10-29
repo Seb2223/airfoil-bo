@@ -1,10 +1,11 @@
-"""Summarise results/runs/*.json into a table and two figures.
+"""Summarise results/ into a table, significance tests and figures.
 
     python scripts/analyze.py
 """
 
 import json
 import sys
+from itertools import combinations
 from pathlib import Path
 
 import matplotlib
@@ -12,6 +13,7 @@ import matplotlib
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
 import numpy as np  # noqa: E402
+from scipy.stats import mannwhitneyu  # noqa: E402
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -19,10 +21,19 @@ sys.path.insert(0, str(ROOT))
 from airfoil_bo import geometry, problem, xfoil  # noqa: E402
 
 RESULTS = ROOT / "results"
-METHODS = {  # fixed categorical order: slot 1 blue, 2 orange, 3 aqua
+# Colour follows the entity (fixed slots: 1 blue, 2 orange, 3 aqua, 4 yellow);
+# dict order is only the legend order.
+METHODS = {
     "gp_ei": ("GP + EI, failure classifier", "#2a78d6"),
     "gp_ei_impute": ("GP + EI, failures imputed", "#eb6834"),
     "random": ("Random search", "#1baf7a"),
+    "ens_ei": ("Bootstrapped ensemble + EI, failure classifier", "#eda100"),
+    "ens_ei_plain": ("Plain ensemble + EI, failure classifier", "#e87ba4"),
+}
+CALIBRATION_MODELS = {  # static study: the regression models behind gp_ei / ens_ei, plus the plain recipe
+    "GP": "#2a78d6",
+    "Deep ensemble (bootstrapped)": "#eda100",
+    "Deep ensemble (plain)": "#898781",
 }
 SURFACE, INK, INK2, MUTED, GRID, AXIS = "#fcfcfb", "#0b0b0b", "#52514e", "#898781", "#e1e0d9", "#c3c2b7"
 
@@ -78,12 +89,21 @@ def main():
         at = " / ".join(f"{np.nanmedian(c[:, k - 1]):.1f}" for k in (20, 50, 100))
         gap = best_known - np.nanmedian(c[:, -1])
         match = [first_reaching(row, random_final) for row in c]
-        match_str = "-" if m == "random" else f"{np.median([n if n else np.inf for n in match]):.0f}"
+        match_med = np.median([n if n else np.inf for n in match])
+        match_str = "-" if m == "random" else ("not reached" if np.isinf(match_med) else f"{match_med:.0f}")
         recs = [rec for run in runs[m] for rec in run["records"]]
         fail = np.mean([not rec["ok"] for rec in recs])
         t_prop = np.mean([rec["t_propose"] for rec in recs if rec["t_propose"] > 0] or [0])
         lines.append(f"| {label} | {at} | {gap:.1f} ({gap / best_known:.1%}) | {match_str} "
                      f"| {fail:.0%} | {t_prop:.1f} s |")
+    finals = {m: c[:, -1] for m, c in curves.items()}
+    lines += ["", "Final best L/D, one-sided Mann-Whitney U (row better than column):", "",
+              "| | p |", "|---|---|"]
+    for a, b in combinations([m for m in METHODS if m in finals], 2):
+        if np.median(finals[a]) < np.median(finals[b]):
+            a, b = b, a
+        p = mannwhitneyu(finals[a], finals[b], alternative="greater").pvalue
+        lines.append(f"| {METHODS[a][0]} > {METHODS[b][0]} | {p:.2g} |")
     table = "\n".join(lines)
     print(table)
     print(f"\nBest known L/D: {best_known:.1f}  (best from runs: {best_rec['ld']:.1f} by {best_m})")
@@ -115,10 +135,10 @@ def main():
     ax.set_ylim(min(lows) - 2, best_known + 3)
     ax.set_xlabel("XFoil simulations used")
     ax.set_ylabel("Best mean L/D found so far")
-    ax.set_title("Bayesian optimisation finds better airfoils with fewer simulations", pad=22)
+    ax.set_title("GP-based BO beats random search; ensemble-based BO does not", pad=22)
     ax.text(0, 1.015, "Median over seeds, band = interquartile range. 12%-thick airfoil, Re = 1e6, "
             "L/D averaged at CL = 0.4, 0.6, 0.8.", transform=ax.transAxes, color=INK2, fontsize=9, va="bottom")
-    ax.legend(loc="lower right")
+    ax.legend(loc="upper center", bbox_to_anchor=(0.5, -0.13), ncol=2, fontsize=9)
     fig.savefig(RESULTS / "convergence.png", dpi=160)
     plt.close(fig)
 
@@ -137,7 +157,7 @@ def main():
     ax1.set_xlabel("x / c")
     ax1.set_ylabel("y / c")
     ax1.set_title("Shape")
-    ax2.legend(loc="lower right", fontsize=8.5)
+    ax2.legend(loc="upper center", bbox_to_anchor=(0.5, -0.17), fontsize=8.5)
     ax2.axhspan(min(problem.CL_TARGETS), max(problem.CL_TARGETS), color=GRID, alpha=0.6, linewidth=0, zorder=0)
     ax2.text(0.98, max(problem.CL_TARGETS), "design CL range", transform=ax2.get_yaxis_transform(),
              ha="right", va="bottom", color=INK2, fontsize=9)
@@ -147,6 +167,90 @@ def main():
     fig.savefig(RESULTS / "best_airfoil.png", dpi=160)
     plt.close(fig)
     print(f"\nBest design u = {np.round(best_rec['u'], 3).tolist()}  {geometry.describe(np.array(best_rec['u']))}")
+
+    if (RESULTS / "calibration.json").exists():
+        cal = json.loads((RESULTS / "calibration.json").read_text())
+        plot_calibration(cal)
+        write_calibration_tables(cal)
+
+
+def write_calibration_tables(cal):
+    levels = cal["static"]["levels"]
+    i50, i90 = levels.index(0.5), levels.index(0.9)
+    lines = ["Static: trained on n random designs, scored on 1,000 held-out random designs.", "",
+             "| n | Model | RMSE | NLL | 50% interval holds | 90% interval holds |", "|---|---|---|---|---|---|"]
+    for n in cal["static"]["sizes"]:
+        for name, r in cal["static"]["regression"][str(n)].items():
+            lines.append(f"| {n} | {name} | {r['rmse']:.1f} | {r['nll']:.2f} | {r['coverage'][i50]:.0%} | {r['coverage'][i90]:.0%} |")
+    lines += ["", "| n | Failure classifier Brier | Base-rate Brier |", "|---|---|---|"]
+    for n in cal["static"]["sizes"]:
+        c = cal["static"]["classifier"][str(n)]
+        lines.append(f"| {n} | {c['GP classifier']['brier']:.3f} | {c['Base rate']['brier']:.3f} |")
+    lines += ["", "In the loop: model predictions at each proposed design vs the XFoil result.", "",
+              "| Method | 50% interval holds | 90% interval holds | Median (actual - predicted) L/D "
+              "| Mean predicted P(success) | Actual success |", "|---|---|---|---|---|---|"]
+    for m, r in cal.get("in_loop", {}).items():
+        p = f"{r['mean_p_success']:.1%}" if "mean_p_success" in r else "-"
+        a = f"{r['actual_success']:.1%}" if "actual_success" in r else "-"
+        lines.append(f"| {METHODS[m][0]} | {r['coverage'][i50]:.0%} | {r['coverage'][i90]:.0%} "
+                     f"| {r['median_error']:+.1f} | {p} | {a} |")
+    (RESULTS / "calibration.md").write_text("\n".join(lines) + "\n")
+    print("\n" + "\n".join(lines))
+
+
+def plot_calibration(cal):
+    """Figure 3: held-out NLL and 90% coverage vs training size; reliability inside the BO loop."""
+    static, loop = cal.get("static"), cal.get("in_loop", {})
+    fig, axes = plt.subplots(1, 3, figsize=(13, 4.2), layout="constrained")
+    if static:
+        sizes = static["sizes"]
+        i90 = static["levels"].index(0.9)
+        for name, color in CALIBRATION_MODELS.items():
+            nll = [static["regression"][str(n)][name]["nll"] for n in sizes]
+            cov = [static["regression"][str(n)][name]["coverage"][i90] for n in sizes]
+            style = dict(color=color, linewidth=2, marker="o", markersize=5, markeredgecolor=SURFACE, markeredgewidth=1.5)
+            axes[0].plot(sizes, nll, label=name, **style)
+            axes[1].plot(sizes, cov, **style)
+        # Clip the NLL axis to where the GP / bootstrapped-ensemble comparison lives;
+        # label any point pushed off the top instead of squashing the scale for it.
+        nll_top = 1.25 * max(static["regression"][str(n)][name]["nll"] for n in sizes for name in list(CALIBRATION_MODELS)[:2])
+        axes[0].set_ylim(top=nll_top)
+        for name, color in CALIBRATION_MODELS.items():
+            for n in sizes:
+                v = static["regression"][str(n)][name]["nll"]
+                if v > nll_top:
+                    axes[0].annotate(f"{v:.1f} ↑", (n, nll_top), xytext=(4, -12), textcoords="offset points",
+                                     color=INK2, fontsize=9)
+        axes[1].axhline(0.9, color=MUTED, linewidth=1, zorder=0)
+        axes[1].text(sizes[-1], 0.9, "ideal", color=INK2, fontsize=9, ha="right", va="bottom")
+        axes[1].set_ylim(0.5, 1.0)
+        for ax in axes[:2]:
+            ax.set_xscale("log")
+            ax.set_xticks(sizes, [str(n) for n in sizes])
+            ax.minorticks_off()
+            ax.set_xlabel("Random training designs")
+        axes[0].set_ylabel("Held-out negative log-likelihood (lower is better)")
+        axes[0].set_title("Fit quality on 1,000 held-out designs")
+        axes[0].legend(loc="lower left", fontsize=8.5)
+        axes[1].set_ylabel("Share of held-out designs inside the 90% interval")
+        axes[1].set_title("Do 90% intervals hold 90%?")
+    levels = cal["static"]["levels"] if static else [0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 0.95]
+    ax = axes[2]
+    ax.plot([0, 1], [0, 1], color=MUTED, linewidth=1, zorder=0)
+    short = {"gp_ei": "GP, classifier", "gp_ei_impute": "GP, imputed",
+             "ens_ei": "Bootstrapped ensemble", "ens_ei_plain": "Plain ensemble"}
+    for m, row in loop.items():
+        ax.plot(levels, row["coverage"], color=METHODS[m][1], linewidth=2, marker="o", markersize=5,
+                markeredgecolor=SURFACE, markeredgewidth=1.5, label=short.get(m, METHODS[m][0]))
+    ax.set_xlim(0, 1)
+    ax.set_ylim(0, 1)
+    ax.set_aspect("equal")
+    ax.set_xlabel("Nominal interval coverage")
+    ax.set_ylabel("Observed coverage at proposed designs")
+    ax.set_title("Calibration inside the BO loop")
+    ax.legend(loc="lower right", fontsize=8)
+    fig.savefig(RESULTS / "calibration.png", dpi=160)
+    plt.close(fig)
 
 
 if __name__ == "__main__":

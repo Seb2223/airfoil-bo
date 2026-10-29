@@ -9,6 +9,12 @@ number (Gelbart, Snoek & Adams 2014).
 
 `failures="impute"` is the common shortcut for comparison: drop the classifier
 and pretend every failed design scored the worst L/D seen so far.
+`model="ensemble"` swaps the regression GP for a deep ensemble
+(airfoil_bo/ensemble.py) and keeps everything else the same.
+
+Each proposal also records what the models predicted for the chosen design
+(mean, std, P(success)), so calibration *where the optimiser actually looks*
+can be checked against the simulated outcome afterwards.
 """
 
 import time
@@ -32,6 +38,7 @@ from gpytorch.models import ApproximateGP
 from gpytorch.variational import CholeskyVariationalDistribution, VariationalStrategy
 
 from . import geometry, problem
+from .ensemble import DeepEnsemble
 
 DTYPE = torch.double
 BOUNDS = torch.stack([torch.zeros(geometry.DIM), torch.ones(geometry.DIM)]).to(DTYPE)
@@ -54,16 +61,38 @@ class FeasibilityClassifier(ApproximateGP):
         return self.likelihood(self(X)).probs
 
 
-def fit_classifier(X: torch.Tensor, ok: torch.Tensor, steps: int = 300) -> FeasibilityClassifier:
+def fit_classifier(X: torch.Tensor, ok: torch.Tensor) -> FeasibilityClassifier:
+    """Maximise the ELBO with L-BFGS (Adam as a fallback if L-BFGS goes non-finite).
+
+    L-BFGS is ~3x faster here than 300 Adam steps and reaches a lower loss:
+    the Adam fit was not converged (P(success) differed by up to 0.35).
+    """
+    target = ok.to(DTYPE)
     clf = FeasibilityClassifier(X).to(DTYPE)
     clf.train()
     mll = VariationalELBO(clf.likelihood, clf, num_data=X.shape[0])
-    opt = torch.optim.Adam(clf.parameters(), lr=0.05)
-    for _ in range(steps):
+    opt = torch.optim.LBFGS(clf.parameters(), lr=1, max_iter=100, line_search_fn="strong_wolfe")
+
+    def closure():
         opt.zero_grad()
-        loss = -mll(clf(X), ok.to(DTYPE))
+        loss = -mll(clf(X), target)
         loss.backward()
-        opt.step()
+        return loss
+
+    try:
+        opt.step(closure)
+        converged = all(torch.isfinite(p).all() for p in clf.parameters())
+    except (RuntimeError, ValueError):  # e.g. a failed Cholesky in the line search
+        converged = False
+    if not converged:
+        clf = FeasibilityClassifier(X).to(DTYPE)
+        clf.train()
+        mll = VariationalELBO(clf.likelihood, clf, num_data=X.shape[0])
+        adam = torch.optim.Adam(clf.parameters(), lr=0.05)
+        for _ in range(300):
+            adam.zero_grad()
+            (-mll(clf(X), target)).backward()
+            adam.step()
     clf.eval()
     return clf
 
@@ -90,29 +119,56 @@ class FeasibilityWeightedLogEI(AcquisitionFunction):
         return value
 
 
-def propose(evals: list[problem.Evaluation], failures: str = "classifier", seed: int = 0) -> np.ndarray:
-    """Next design to simulate, given everything evaluated so far."""
+METHODS = {  # method name -> (failure handling, regression model)
+    "gp_ei": ("classifier", "gp"),
+    "gp_ei_impute": ("impute", "gp"),
+    "ens_ei": ("classifier", "ensemble"),
+    "ens_ei_plain": ("classifier", "ensemble_plain"),  # no bootstrap: worse static calibration
+}
+
+
+def propose(evals: list[problem.Evaluation], failures: str = "classifier", model: str = "gp",
+            seed: int = 0) -> tuple[np.ndarray, dict]:
+    """Next design to simulate, plus what the models predicted for it."""
     X = torch.tensor([e.u for e in evals], dtype=DTYPE)
     ok = torch.tensor([e.ok for e in evals])
     y_ok = torch.tensor([e.ld for e in evals if e.ok], dtype=DTYPE)
     if ok.sum() < 2:  # nothing to model yet
-        return draw_sobol_samples(BOUNDS, n=1, q=1, seed=seed).squeeze().numpy()
+        return draw_sobol_samples(BOUNDS, n=1, q=1, seed=seed).squeeze().numpy(), {}
 
     if failures == "classifier":
-        gp = fit_objective_gp(X[ok], y_ok)
+        X_reg, y_reg = X[ok], y_ok
         clf = fit_classifier(X, ok) if (~ok).any() else None
     elif failures == "impute":
-        y = torch.full((len(evals),), y_ok.min().item(), dtype=DTYPE)
-        y[ok] = y_ok
-        gp, clf = fit_objective_gp(X, y), None
+        X_reg = X
+        y_reg = torch.full((len(evals),), y_ok.min().item(), dtype=DTYPE)
+        y_reg[ok] = y_ok
+        clf = None
     else:
         raise ValueError(failures)
+    if model == "gp":
+        reg = fit_objective_gp(X_reg, y_reg)
+    elif model == "ensemble":
+        reg = DeepEnsemble(X_reg, y_reg, seed=seed)
+    elif model == "ensemble_plain":
+        reg = DeepEnsemble(X_reg, y_reg, seed=seed, bootstrap=False)
+    else:
+        raise ValueError(model)
 
-    acq = FeasibilityWeightedLogEI(gp, best_f=y_ok.max().item(), clf=clf)
+    acq = FeasibilityWeightedLogEI(reg, best_f=y_ok.max().item(), clf=clf)
     with torch.random.fork_rng():
         torch.manual_seed(seed)
         cand, _ = optimize_acqf(acq, bounds=BOUNDS, q=1, num_restarts=8, raw_samples=1024)
-    return cand.squeeze(0).detach().numpy()
+    cand = cand.detach()
+    with torch.no_grad():
+        latent, noisy = reg.posterior(cand), reg.posterior(cand, observation_noise=True)
+        info = {
+            "pred_mean": latent.mean.item(),
+            "pred_std": latent.variance.sqrt().item(),  # uncertainty about the function
+            "pred_std_obs": noisy.variance.sqrt().item(),  # ... plus observation noise
+            "p_success": clf.prob(cand).item() if clf is not None else None,
+        }
+    return cand.squeeze(0).numpy(), info
 
 
 def run(method: str, seed: int, budget: int = 100, n_init: int = 10, log=print) -> list[dict]:
@@ -120,10 +176,10 @@ def run(method: str, seed: int, budget: int = 100, n_init: int = 10, log=print) 
     rng = np.random.default_rng(seed)
     records, evals = [], []
 
-    def add(u, t_propose):
+    def add(u, t_propose, info=None):
         e = problem.evaluate(u)
         evals.append(e)
-        records.append({**vars(e), "t_propose": t_propose})
+        records.append({**vars(e), "t_propose": t_propose, **(info or {})})
         best = max((r["ld"] for r in records if r["ok"]), default=float("nan"))
         log(f"[{method} s{seed}] {len(records):3d}/{budget}  ok={e.ok!s:5}  "
             f"L/D={e.ld or float('nan'):6.1f}  best={best:6.1f}")
@@ -133,11 +189,11 @@ def run(method: str, seed: int, budget: int = 100, n_init: int = 10, log=print) 
             add(rng.random(geometry.DIM), 0.0)
         return records
 
-    failures = {"gp_ei": "classifier", "gp_ei_impute": "impute"}[method]
+    failures, model = METHODS[method]
     for u in draw_sobol_samples(BOUNDS, n=n_init, q=1, seed=seed).squeeze(1).numpy():
         add(u, 0.0)
     for i in range(budget - n_init):
         t = time.perf_counter()
-        u = propose(evals, failures=failures, seed=seed * 10_000 + i)
-        add(u, time.perf_counter() - t)
+        u, info = propose(evals, failures=failures, model=model, seed=seed * 10_000 + i)
+        add(u, time.perf_counter() - t, info)
     return records

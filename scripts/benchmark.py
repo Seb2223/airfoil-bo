@@ -1,6 +1,6 @@
 """Run every (method, seed) pair and save one JSON per run under results/runs/.
 
-    python scripts/benchmark.py --methods random gp_ei gp_ei_impute --seeds 10 --budget 100
+    python scripts/benchmark.py --methods random gp_ei gp_ei_impute ens_ei --seeds 30 --budget 100
 """
 
 import argparse
@@ -14,6 +14,9 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 RUNS = ROOT / "results" / "runs"
+# Rough relative cost per run; the slowest jobs are submitted first so the
+# pool doesn't finish with a long tail of slow runs on a few cores.
+COST = {"ens_ei": 4, "gp_ei": 3, "gp_ei_impute": 2, "random": 1}
 
 
 def job(method: str, seed: int, budget: int, n_init: int) -> str:
@@ -36,8 +39,8 @@ def job(method: str, seed: int, budget: int, n_init: int) -> str:
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--methods", nargs="+", default=["random", "gp_ei", "gp_ei_impute"])
-    p.add_argument("--seeds", type=int, default=10)
+    p.add_argument("--methods", nargs="+", default=["random", "gp_ei", "gp_ei_impute", "ens_ei"])
+    p.add_argument("--seeds", type=int, default=30)
     p.add_argument("--budget", type=int, default=100)
     p.add_argument("--n-init", type=int, default=10)
     p.add_argument("--workers", type=int, default=10)
@@ -47,6 +50,7 @@ def main():
     RUNS.mkdir(parents=True, exist_ok=True)
     jobs = [(m, s) for s in range(args.seeds) for m in args.methods
             if args.overwrite or not (RUNS / f"{m}_s{s}.json").exists()]
+    jobs.sort(key=lambda job: -COST.get(job[0], 0))
     print(f"{len(jobs)} runs to do", flush=True)
     with ProcessPoolExecutor(max_workers=args.workers) as pool:
         futures = [pool.submit(job, m, s, args.budget, args.n_init) for m, s in jobs]

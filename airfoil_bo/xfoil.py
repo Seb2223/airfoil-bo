@@ -115,10 +115,11 @@ def polar(
 ) -> list[OperatingPoint]:
     """Converged points of an angle-of-attack sweep covering `cl_range`, sorted by alpha.
 
-    Sweeps up from 0 deg, then (if needed) down from 0 deg, each point
-    warm-started from its neighbour. A direction stops once it has passed the
-    CL range, hit the alpha limit, or failed several points in a row (usually
-    stall). A failed point is retried once from a re-initialised boundary layer.
+    Solves 0 deg, sweeps down from there (if needed), then re-solves 0 deg
+    from scratch and sweeps up, so both directions are warm-started from the
+    0 deg solution. A direction stops once it has passed the CL range, hit
+    the alpha limit, or failed several points in a row (usually stall). A
+    failed point is retried once from a re-initialised boundary layer.
     """
     cl_lo, cl_hi = cl_range
     alpha_lo, alpha_hi = alpha_limits
@@ -152,10 +153,18 @@ def polar(
                     if done(p):
                         return
 
-            sweep(np.arange(0.0, alpha_hi + 1e-9, step), lambda p: p.cl > cl_hi)
-            if not points or points[0].cl >= cl_lo:
-                session.send("INIT")
+            # Starting the down sweep cold at -step (after the up sweep) lost
+            # the low-CL end of many otherwise clean polars.
+            p0 = point(0.0)
+            if p0 is not None:
+                points.append(p0)
+            if p0 is None or p0.cl >= cl_lo:
                 sweep(np.arange(-step, alpha_lo - 1e-9, -step), lambda p: p.cl < cl_lo)
+            if p0 is None or p0.cl <= cl_hi:
+                session.send("INIT")
+                if p0 is not None:
+                    session.alfa(0.0)  # warm start for the up sweep; already recorded
+                sweep(np.arange(step, alpha_hi + 1e-9, step), lambda p: p.cl > cl_hi)
         except XfoilError:
             pass
         finally:
