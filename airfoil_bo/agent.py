@@ -8,7 +8,12 @@ same format as bo.run, plus the batch it came from and the model's stated
 reason for that batch, so agent runs can be compared with the BO methods
 directly.
 
-Nothing here is XFoil-specific except SYSTEM and `simulate`: to put a CAD
+`run` drives the loop over the Claude API. scripts/agent.py --via claude-code
+drives it through headless Claude Code instead (billed to a Claude plan, not
+the API), with the same prompt and the same Simulator behind a shell command
+(scripts/sim.py).
+
+Nothing here is XFoil-specific except the prompt and `simulate`: to put a CAD
 script (or any other simulator) in the loop, swap in a different prompt and
 tool that wraps it.
 """
@@ -27,7 +32,15 @@ from .problem import CL_TARGETS, RE, evaluate_many
 MODEL = "claude-opus-5-5"
 MAX_BATCH = 8
 
-SYSTEM = f"""\
+_HOW_TO_SIMULATE = {
+    "tool": f"Use the `simulate` tool to evaluate designs, up to {MAX_BATCH} per call.",
+    "shell": f"Evaluate designs by running the shell command ./sim '<designs>' '<rationale>', where <designs> is\n"
+             f"a JSON list of up to {MAX_BATCH} designs (each a list of 7 numbers in [0, 1]) and <rationale> is one or\n"
+             f"two sentences on what this batch tests and why. It prints the results as JSON. It is the only\n"
+             f"command you can run.",
+}
+
+_SYSTEM = f"""\
 You are optimising a 2D airfoil with XFoil in the loop.
 
 Design: 7 numbers u in [0, 1], which set the CST coefficients of the shape.
@@ -41,23 +54,35 @@ Objective (maximise): mean L/D at CL = {", ".join(map(str, CL_TARGETS))}, Re = {
 A design fails if XFoil can't converge a clean polar through every target CL (usually stall before the
 highest CL). Roughly 18% of random designs fail. For reference, NACA 4412 scores 93.5 on this objective.
 
-Use the `simulate` tool to evaluate designs, up to {MAX_BATCH} per call. Each design costs one simulation
+{{how}} Each design costs one simulation
 from a fixed budget, failed or not. Read the per-CL drag, alpha and moment it returns and reason about
 the aerodynamics behind the numbers. Explore early, then refine around what works. Use the whole budget:
 leftover simulations are wasted. When it is spent, reply with the best design and a short account of
 what you learned about the design space."""
 
 
-class Simulator:
-    """Budgeted access to the objective, keeping a record of every simulation."""
+def system_prompt(via: str = "tool") -> str:
+    """The task prompt; `via` says whether the model simulates through the API tool or the shell command."""
+    return _SYSTEM.format(how=_HOW_TO_SIMULATE[via])
 
-    def __init__(self, budget: int, workers: int = 8, log=print):
+
+def kickoff(budget: int) -> str:
+    return f"Your budget is {budget} simulations. Start."
+
+
+class Simulator:
+    """Budgeted access to the objective, keeping a record of every simulation.
+
+    `records` and `t_last` resume a run whose state was saved between calls (scripts/sim.py)."""
+
+    def __init__(self, budget: int, workers: int = 8, log=print, records: list[dict] | None = None,
+                 t_last: float | None = None):
         self.budget = budget
         self.workers = workers
         self.log = log
-        self.records: list[dict] = []
-        self.batches = 0
-        self._t_last = time.time()
+        self.records: list[dict] = records or []
+        self.batches = 1 + max((r["batch"] for r in self.records), default=-1)
+        self.t_last = t_last or time.time()
 
     @property
     def left(self) -> int:
@@ -80,7 +105,7 @@ class Simulator:
         dropped = len(designs) - self.left
         designs = designs[: self.left]
 
-        t_propose = time.time() - self._t_last  # model time since the previous batch returned
+        t_propose = time.time() - self.t_last  # model time since the previous batch returned
         evals = evaluate_many(designs, workers=self.workers)
         batch = []
         for e in evals:
@@ -91,7 +116,7 @@ class Simulator:
             self.log(f"[agent] {len(self.records):3d}/{self.budget}  ok={e.ok!s:5}  "
                      f"L/D={e.ld if e.ok else float('nan'):6.1f}  best={best['ld'] if best else float('nan'):6.1f}")
         self.batches += 1
-        self._t_last = time.time()
+        self.t_last = time.time()
 
         best = self.best()
         out = {
@@ -104,7 +129,8 @@ class Simulator:
         if clipped:
             notes.append("Some values were outside [0, 1] and were clipped; results show the clipped designs.")
         if dropped > 0:
-            notes.append(f"Only the first {len(designs)} designs were run; the budget is now spent.")
+            notes.append(f"Only {len(designs)} of the {len(designs) + dropped} designs were run (the first ones); "
+                         "the budget is now spent.")
         if notes:
             out["note"] = " ".join(notes)
         return json.dumps(out)
@@ -146,9 +172,9 @@ def run(budget: int = 100, model: str = MODEL, effort: str = "high", workers: in
     runner = client.beta.messages.tool_runner(
         model=model,
         max_tokens=16000,
-        system=SYSTEM,
+        system=system_prompt("tool"),
         tools=[simulate],
-        messages=[{"role": "user", "content": f"Your budget is {budget} simulations. Start."}],
+        messages=[{"role": "user", "content": kickoff(budget)}],
         thinking={"type": "adaptive"},
         output_config={"effort": effort},
         cache_control={"type": "ephemeral"},  # each turn resends the history; cache the prefix

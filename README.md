@@ -31,7 +31,7 @@ honest uncertainty actually finds better airfoils.
 | `ens_ei_plain` | Deep ensemble with the plain recipe (no bootstrap) | GP classifier |
 | `gp_ei_tr`, `ens_ei_tr` | As `gp_ei` / `ens_ei`, but the acquisition is optimised only inside a TuRBO-style trust region around the best design | GP classifier |
 | `random` | — | — |
-| `llm_high` | None. Claude (an LLM) picks every design itself, using its own knowledge of aerodynamics (`airfoil_bo/agent.py`) | Claude sees which target CLs failed and decides what to do |
+| `llm_cc_high` (`llm_high` via the API) | None. Claude (an LLM, effort high) picks every design itself, using its own knowledge of aerodynamics (`airfoil_bo/agent.py`) | Claude sees which target CLs failed and decides what to do |
 | `scripts/reference.py` | Differential evolution with 2,870 simulations, the brute-force "best known" reference | |
 
 Every BO method starts from 10 Sobol points and gets 100 XFoil simulations
@@ -69,11 +69,23 @@ one-line rationale for each batch. Runs are saved to `results/agent/`, with
 records in the same format as `results/runs/` plus the batch and the
 rationale. The model, effort level and token usage are saved in each run file.
 
+There are two ways to reach the model, with the same prompt and the same
+simulator behind them:
+
+- **`--via claude-code`**: no API key. Each run is a fresh headless
+  Claude Code session (`claude -p`), billed to the Claude plan the CLI is
+  logged in with. The session runs in an empty temporary directory. Its
+  only tool is Bash, its only allowed command is `./sim` (a wrapper around
+  `scripts/sim.py`, the `simulate` tool as a shell command), and it ignores
+  user settings and MCP servers. It can't see this repository or earlier
+  results. The results in this README come from this route.
+- **`--via api`**: the Claude API through the `anthropic` SDK, billed per
+  token. It needs `ANTHROPIC_API_KEY`.
+
 ```bash
-export ANTHROPIC_API_KEY=...
-.venv/bin/python scripts/agent.py --budget 30 --effort medium   # smoke test, one run
-.venv/bin/python scripts/agent.py --runs 10 --parallel 4        # the comparison: 10 runs x 100 sims, effort high
-.venv/bin/python scripts/analyze.py                             # adds them to summary.md and llm_vs_gp.png
+.venv/bin/python scripts/agent.py --via claude-code --budget 30 --effort medium   # smoke test, one run
+.venv/bin/python scripts/agent.py --via claude-code --runs 10 --parallel 3        # the comparison: 10 runs x 100 sims, effort high
+.venv/bin/python scripts/analyze.py                                               # adds them to summary.md and llm_vs_gp.png
 ```
 
 `analyze.py` only uses agent runs with a 100-simulation budget, so smoke
@@ -264,7 +276,9 @@ and how they work:
   interquartile band on the plot is noisier.
 - **Not exactly reproducible.** There's no seed. Results belong to the
   model version and effort level recorded in each run file and may change
-  with a newer model.
+  with a newer model. They also depend on the route: these runs go through
+  Claude Code's Bash tool, not the API's `simulate` tool, though the prompt
+  and the simulator are the same.
 - **Different costs.** A GP proposal costs a few seconds of CPU. An agent
   run costs API tokens and minutes of model time. `results/summary.md`
   reports tokens, dollars and wall time per run.

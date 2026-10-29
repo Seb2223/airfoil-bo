@@ -32,13 +32,14 @@ METHODS = {  # name -> (label, colour, trust region)
     "ens_ei_plain": ("Plain ensemble + EI, failure classifier", "#e87ba4", False),
     "gp_ei_tr": ("GP + EI, failure classifier, trust region", "#2a78d6", True),
     "ens_ei_tr": ("Bootstrapped ensemble + EI, failure classifier, trust region", "#eda100", True),
-    # Slot 7 (violet) rather than 6 (green): it stays further from aqua and blue
-    # under tritan simulation, and the LLM figure shows all three together.
-    "llm_high": ("Claude agent (scripts/agent.py)", "#4a3aa7", False),
+    # The Claude agent, by route (scripts/agent.py --via). Violet (slot 7) goes to the
+    # route that has runs: it stays further from blue and aqua under tritan simulation.
+    "llm_cc_high": ("Claude agent, via Claude Code", "#4a3aa7", False),
+    "llm_high": ("Claude agent, via the API", "#008300", False),
 }
 MAIN_FIGURE = ["gp_ei", "gp_ei_impute", "random", "ens_ei", "ens_ei_plain"]
 TR_FIGURE = ["gp_ei", "gp_ei_tr", "ens_ei", "ens_ei_tr", "random"]
-LLM_FIGURE = ["gp_ei", "random", "llm_high"]
+LLM_FIGURE = ["gp_ei", "random", "llm_cc_high", "llm_high"]
 # USD per million tokens (input, output, cache read, 5-minute cache write), list prices as of 2026-10.
 PRICES = {"claude-opus-5-5": (4.0, 20.0, 0.20, 5.0)}
 CALIBRATION_MODELS = {  # static study: the regression models behind gp_ei / ens_ei, plus the plain recipe
@@ -203,7 +204,7 @@ def main():
             labels={"gp_ei": "GP, whole space", "gp_ei_tr": "GP, trust region",
                     "ens_ei": "Bootstrapped ensemble, whole space", "ens_ei_tr": "Bootstrapped ensemble, trust region"},
             subtitle="All BO methods: EI + failure classifier. Median over seeds, band = interquartile range.")
-    if "llm_high" in curves:
+    if any(m in curves for m in ("llm_high", "llm_cc_high")):
         plot_convergence(
             curves, LLM_FIGURE, "Claude agent vs GP-based BO, same 100-simulation budget",
             RESULTS / "llm_vs_gp.png", ref, naca, best_known,
@@ -262,8 +263,13 @@ def llm_tables(runs, curves):
         keys = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
         tok = np.array([[r["usage"][k] for k in keys] for r in rs], dtype=float)
         med = np.median(tok, axis=0)
-        price = PRICES.get(models[0]) if len(models) == 1 else None
-        cost = f", ${np.median(tok @ np.array(price)) / 1e6:.2f} at list prices" if price else ""
+        if all(r.get("api_equivalent_cost_usd") is not None for r in rs):
+            # Claude Code runs are billed to a Claude plan; it reports what they would cost on the API.
+            cost = f", ${np.median([r['api_equivalent_cost_usd'] for r in rs]):.2f} API-equivalent (billed to the plan)"
+        elif (price := PRICES.get(models[0]) if len(models) == 1 else None):
+            cost = f", ${np.median(tok @ np.array(price)) / 1e6:.2f} at list prices"
+        else:
+            cost = ""
         stops = ", ".join(f"{s} x{n}" for s, n in zip(*np.unique([str(r["stop_reason"]) for r in rs], return_counts=True)))
         lines += ["", f"{METHODS[m][0]}: {len(rs)} runs, model {', '.join(models)}, "
                       f"effort {', '.join(sorted({r['effort'] for r in rs}))}, stop reasons: {stops}. "
