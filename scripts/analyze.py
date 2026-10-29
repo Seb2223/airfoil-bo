@@ -206,7 +206,7 @@ def main():
             subtitle="All BO methods: EI + failure classifier. Median over seeds, band = interquartile range.")
     if any(m in curves for m in ("llm_high", "llm_cc_high")):
         plot_convergence(
-            curves, LLM_FIGURE, "Claude agent vs GP-based BO, same 100-simulation budget",
+            curves, LLM_FIGURE, "Claude starts ahead of GP-based BO and stays ahead",
             RESULTS / "llm_vs_gp.png", ref, naca, best_known,
             subtitle="Median over seeds / runs, band = interquartile range. Not an equal comparison: see README.")
 

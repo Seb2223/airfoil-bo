@@ -5,7 +5,9 @@ model learns L/D from the shape, a GP classifier learns where XFoil fails
 to converge, and the next shape to simulate is the one with the best
 feasibility-weighted expected improvement. On top of that, a calibration
 study asks whether the surrogate's uncertainty is honest, and whether
-honest uncertainty actually finds better airfoils.
+honest uncertainty actually finds better airfoils. A last experiment
+hands the loop to Claude, an LLM, to see whether knowing aerodynamics
+beats a GP with no prior knowledge on the same budget.
 
 ## The problem
 
@@ -129,6 +131,10 @@ References:
 - **Deep-ensemble BO is worse than random search** (p = 0.02 bootstrapped,
   p = 0.04 plain). It fails a third to half of its simulations. The next
   section explains why.
+
+An LLM agent beats all of these (median 116.6 at 100 simulations), but
+it gets information the BO methods don't. See
+[Claude vs the GP](#does-knowing-aerodynamics-help-claude-vs-the-gp).
 
 ### Is the uncertainty honest?
 
@@ -283,20 +289,69 @@ and how they work:
   run costs API tokens and minutes of model time. `results/summary.md`
   reports tokens, dollars and wall time per run.
 
-Results: *pending. Run the commands under
-[LLM in the loop](#llm-in-the-loop), then fill this in from
-`results/summary.md` and `results/llm_vs_gp.png`.*
+**Result: yes, by a clear margin.** 10 runs at effort high, via Claude
+Code:
+
+![Claude vs GP](results/llm_vs_gp.png)
+
+| Method | Median best L/D after 10 / 20 / 50 / 100 sims | Median gap to best known at 100 sims | Sims to match random search's 100-sim median (105.2) | Failed sims | Median gain over sims 51–100 | Median sim where the final best was found |
+|---|---|---|---|---|---|---|
+| Claude agent (10 runs) | 107.9 / 111.2 / 114.5 / **116.6** | **1.5 (1.2%)** | **2** (in its first batch) | **1%** | +2.2 | 97 |
+| GP + EI, failure classifier | 96.1 / 104.0 / 110.9 / 113.2 | 4.8 (4.1%) | 22 | 6% | +1.9 | 82 |
+| Random search | 94.7 / 99.8 / 104.0 / 105.2 | 12.9 (10.9%) | - | 18% | +0.3 | 56 |
+
+- **Claude beats every BO method at every budget.** After 100
+  simulations its median is 116.6, against 113.2 for GP + EI
+  (p = 6·10⁻⁵) and 114.2 for the best BO variant, the GP with a trust
+  region (p = 6·10⁻⁴). The worst of the 10 runs (115.4) beats the median
+  of every BO method. The best run found 117.9, the best design of any
+  run in this repo and within 0.2 of the differential-evolution optimum,
+  which took 29× as many simulations.
+- **The early lead comes from a sensible opening, part physics and part
+  geometry.** Every run opened with nearly the same batch: the centre of
+  the box plus one-at-a-time changes. The centre alone scores 102.4, about
+  what random search reaches in 100 simulations. In 8 of the 10 runs the
+  best design in that first batch was the centre with more camber
+  (~3.5%, L/D 107.9), the textbook choice for a design CL around 0.6.
+  After the same 8 simulations, before seeing any result, Claude's median
+  best was 107.9 against 95.5 for the GP. Some of that lead is just
+  starting at the centre, which a BO method could also do by adding the
+  centre point to its initial design.
+- **It doesn't plateau, and it wastes almost nothing.** It gains 2.2 L/D
+  over simulations 51–100 (the GP gains 1.9), and the median run found
+  its final best in its last batch. So the budget ran out before the
+  search did. There were no repeated designs and no unused simulations,
+  and only 1% of designs failed (GP 6%, random 18%). The rationales show
+  a methodical search: one-at-a-time sensitivity steps on each camber
+  weight, then combining the directions that helped, then small
+  polishing steps.
+- **The 10 runs are less independent than 30 BO seeds.** With the same
+  prompt and no seed, the opening batches are almost identical, and two
+  runs share a median of 8 of their 100 designs. The spread between runs
+  comes only from sampling in the model. That makes the band on the plot
+  narrow and the p-values somewhat optimistic. The robust statement is
+  the one above: every Claude run beat the median of every BO method.
+- **Cost.** A run took about 2 minutes and 13 calls to the simulator
+  (batches of 8). It used ~270k input tokens (mostly cache reads) and
+  ~7.6k output tokens, about $0.46 at API prices, billed here to a Claude
+  plan instead. A GP run is free but spends about 8 minutes of CPU on its
+  90 proposals.
+- **What this doesn't tell us:** whether the win comes from aerodynamics
+  knowledge or from the richer feedback (per-CL drag, which CLs failed).
+  Next steps has an experiment that separates the two.
 
 ### The best airfoil
 
 ![Best airfoil](results/best_airfoil.png)
 
-The best shape found by any BO run (L/D 117.3, GP with trust region) and
-the differential-evolution optimum (118.1) are nearly the same
-laminar-flow design:
+The best shape found by any run (L/D 117.9, Claude agent, shown above),
+the best BO run (117.3, GP with trust region) and the
+differential-evolution optimum (118.1) are nearly the same laminar-flow
+design:
 
 | | Max thickness at | Max camber |
 |---|---|---|
+| Best Claude run | 41% chord | 3.5% at 56% chord |
 | Best BO run | 40% chord | 3.3% at 56% chord |
 | Differential evolution | 41% chord | 3.5% at 56% chord |
 | NACA 4412 (for comparison) | 30% chord | 4% at 40% chord |
@@ -359,8 +414,24 @@ bucket placed just above CL 0.8.
    there, and it's where trust regions usually matter most.
 4. **Multi-fidelity:** NeuralFoil (milliseconds) as the cheap source and
    XFoil as the accurate one.
+5. **Where does Claude's win come from?** Rerun the agent with only what
+   the GP gets: the mean L/D, a success flag, and 7 unnamed parameters.
+   If it still wins, the advantage is the search strategy. If it falls
+   back to the GP, it was the richer feedback and the described design
+   space. A GP whose initial design includes the box centre would also
+   show how much of the early lead is just the starting point.
 
 ## Changes since the first version
+
+**Fourth round:** added the LLM agent (`airfoil_bo/agent.py`,
+`scripts/agent.py`, `scripts/sim.py`) and 10 runs of it, run through
+Claude Code (`llm_cc_high`). `results/summary.md` gains a 10-simulation
+column, a plateau-and-waste table and the agent's token costs. There's a
+new figure, `results/llm_vs_gp.png`, and `results/best_airfoil.png` now
+shows Claude's design, the best of any run. A first batch of agent runs
+hit the Claude plan's usage limit partway through. Those runs were thrown
+away and redone, and `scripts/agent.py` no longer saves a run that ends
+on an error.
 
 **Third round:** added the trust-region variants (`TrustRegion` in
 `airfoil_bo/bo.py`; `gp_ei_tr` and `ens_ei_tr`, 30 seeds each). Added a

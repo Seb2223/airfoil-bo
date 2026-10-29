@@ -35,6 +35,10 @@ USAGE_KEYS = ("input_tokens", "cache_read_input_tokens", "cache_creation_input_t
 from airfoil_bo import agent  # noqa: E402
 
 
+class RunFailed(RuntimeError):
+    pass
+
+
 def method_name(args) -> str:
     return f"llm_{args.effort}" if args.via == "api" else f"llm_cc_{args.effort}"
 
@@ -67,6 +71,10 @@ def run_claude_code(args, log_path: Path) -> dict:
     usage = out.get("usage") or {}
     with log_path.open("a") as log:
         print(f"[claude] {out.get('result', '')}", file=log)
+    if out.get("is_error") or out.get("subtype") != "success" or "hit your" in out.get("result", "")[:200]:
+        # A session cut off by the plan's usage limit (or any other error) says nothing about the
+        # optimiser, so it is not saved as a run; rerunning the script redoes it.
+        raise RunFailed(f"{out.get('subtype')}: {out.get('result', '')[:200]} (after {len(records)} sims)")
     return {"model": args.model, "effort": args.effort, "budget": args.budget,
             "stop_reason": out.get("stop_reason") or out.get("subtype"), "final_answer": out.get("result", ""),
             "usage": {k: usage.get(k, 0) for k in USAGE_KEYS},
@@ -110,7 +118,15 @@ def main():
     with ThreadPoolExecutor(max_workers=args.parallel) as pool:
         futures = [pool.submit(job, i, args) for i in todo]
         for f in as_completed(futures):
-            print(f.result(), flush=True)
+            if f.cancelled():
+                continue
+            try:
+                print(f.result(), flush=True)
+            except RunFailed as exc:
+                # Usually the plan's usage limit, which every later run would hit too.
+                cancelled = sum(g.cancel() for g in futures if not g.done())
+                print(f"run failed, not saved: {exc}" + (f"; {cancelled} queued runs cancelled" if cancelled else ""),
+                      flush=True)
 
 
 if __name__ == "__main__":
