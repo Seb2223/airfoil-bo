@@ -4,3 +4,4 @@ botorch
 numpy
 scipy
 matplotlib
+anthropic

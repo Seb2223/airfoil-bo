@@ -56,6 +56,25 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 .venv/bin/python scripts/analyze.py                                       # tables + figures in results/
 ```
 
+### LLM in the loop
+
+`scripts/agent.py` hands the loop to Claude instead of a surrogate model
+(`airfoil_bo/agent.py`). Claude gets one tool, `simulate`, which runs XFoil
+on up to 8 designs per call. The tool uses the same objective and the same
+budget accounting as the benchmark. For each design Claude sees the per-CL
+alpha, drag, L/D and moment plus a few shape numbers, and it has to give a
+one-line rationale for each batch. Runs are saved to `results/agent/`, with
+records in the same format as `results/runs/`.
+
+```bash
+export ANTHROPIC_API_KEY=...
+.venv/bin/python scripts/agent.py --budget 100                  # default effort: high
+.venv/bin/python scripts/agent.py --budget 30 --effort medium   # cheaper smoke test
+```
+
+Only the system prompt and the `simulate` tool are specific to XFoil. To
+put a CAD script in the loop instead, replace those two.
+
 ## Results
 
 ### Optimisation
