@@ -31,10 +31,12 @@ honest uncertainty actually finds better airfoils.
 | `ens_ei_plain` | Deep ensemble with the plain recipe (no bootstrap) | GP classifier |
 | `gp_ei_tr`, `ens_ei_tr` | As `gp_ei` / `ens_ei`, but the acquisition is optimised only inside a TuRBO-style trust region around the best design | GP classifier |
 | `random` | — | — |
+| `llm_high` | None. Claude (an LLM) picks every design itself, using its own knowledge of aerodynamics (`airfoil_bo/agent.py`) | Claude sees which target CLs failed and decides what to do |
 | `scripts/reference.py` | Differential evolution with 2,870 simulations, the brute-force "best known" reference | |
 
 Every BO method starts from 10 Sobol points and gets 100 XFoil simulations
-in total.
+in total. The Claude agent gets the same 100 simulations but no initial
+design.
 
 ## Setup
 
@@ -64,13 +66,18 @@ on up to 8 designs per call. The tool uses the same objective and the same
 budget accounting as the benchmark. For each design Claude sees the per-CL
 alpha, drag, L/D and moment plus a few shape numbers, and it has to give a
 one-line rationale for each batch. Runs are saved to `results/agent/`, with
-records in the same format as `results/runs/`.
+records in the same format as `results/runs/` plus the batch and the
+rationale. The model, effort level and token usage are saved in each run file.
 
 ```bash
 export ANTHROPIC_API_KEY=...
-.venv/bin/python scripts/agent.py --budget 100                  # default effort: high
-.venv/bin/python scripts/agent.py --budget 30 --effort medium   # cheaper smoke test
+.venv/bin/python scripts/agent.py --budget 30 --effort medium   # smoke test, one run
+.venv/bin/python scripts/agent.py --runs 10 --parallel 4        # the comparison: 10 runs x 100 sims, effort high
+.venv/bin/python scripts/analyze.py                             # adds them to summary.md and llm_vs_gp.png
 ```
+
+`analyze.py` only uses agent runs with a 100-simulation budget, so smoke
+tests don't leak into the comparison.
 
 Only the system prompt and the `simulate` tool are specific to XFoil. To
 put a CAD script in the loop instead, replace those two.
@@ -216,6 +223,55 @@ optimised: a box around the best design so far. As in TuRBO-1:
   proposals faster (3.7 s vs 5.4 s), probably because optimising the
   acquisition over a smaller box converges sooner. It also produced the single best design of any run
   (L/D 117.3, within 0.7% of the differential-evolution optimum).
+
+### Does knowing aerodynamics help? Claude vs the GP
+
+The GP has no prior knowledge: it learns L/D from the numbers alone.
+Claude has never seen this objective, but it knows aerodynamics: drag
+buckets, aft loading, leading-edge radius, stall. The question is whether
+that knowledge beats a GP with no prior on the same 100 simulations.
+Either answer is worth knowing. Beyond who wins, the analysis also checks
+whether an early lead fades and whether the agent wastes simulations
+(repeated designs, unused budget, failures).
+
+**This is not an equal comparison.** The two differ in what they are told
+and how they work:
+
+- **Richer feedback.** For every simulation, Claude sees alpha, CD, L/D
+  and CM at each target CL, which target CLs failed to converge, the
+  maximum camber and its position, and the position of maximum thickness.
+  The GP sees one number (mean L/D) and a success flag.
+- **A described design space.** The prompt says what each parameter does
+  physically (leading-edge bluntness, aft thickness, camber from leading
+  to trailing edge). For the GP they are 7 anonymous coordinates.
+- **Facts from this study.** The prompt gives the NACA 4412 score (93.5)
+  and the ~18% failure rate of random designs, both measured here. It does
+  not give the differential-evolution optimum (118.1) or anything from
+  the BO runs.
+- **Its own knowledge of aerodynamics.** That's the point of the
+  question, but it means the 100-simulation budget doesn't count
+  everything that went into Claude's choices.
+- **Batches instead of single proposals.** Claude picks up to 8 designs
+  per call; the GP picks one at a time. This cuts both ways: the GP
+  updates after every simulation, while Claude sees results less often
+  but plans each batch as a whole and gets them back faster (XFoil runs
+  in parallel).
+- **No initial design.** The BO methods spend their first 10 simulations
+  on Sobol points. Claude chooses all 100 itself.
+- **Fewer runs.** Agent runs cost money and time, so there are 5–10 of
+  them against 30 seeds per BO method. The Mann–Whitney p-values in
+  `results/summary.md` take the sample sizes into account, but the
+  interquartile band on the plot is noisier.
+- **Not exactly reproducible.** There's no seed. Results belong to the
+  model version and effort level recorded in each run file and may change
+  with a newer model.
+- **Different costs.** A GP proposal costs a few seconds of CPU. An agent
+  run costs API tokens and minutes of model time. `results/summary.md`
+  reports tokens, dollars and wall time per run.
+
+Results: *pending. Run the commands under
+[LLM in the loop](#llm-in-the-loop), then fill this in from
+`results/summary.md` and `results/llm_vs_gp.png`.*
 
 ### The best airfoil
 

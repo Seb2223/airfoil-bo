@@ -4,8 +4,9 @@ The model gets one tool, `simulate`, which scores a batch of unit-cube designs
 with exactly the benchmark objective (problem.evaluate) and charges each design
 against a fixed simulation budget. The loop ends when the model stops calling
 the tool, normally once the budget is spent. Every simulation is recorded in the
-same format as bo.run, plus the model's stated reason for the batch, so agent
-runs can be compared with the BO methods directly.
+same format as bo.run, plus the batch it came from and the model's stated
+reason for that batch, so agent runs can be compared with the BO methods
+directly.
 
 Nothing here is XFoil-specific except SYSTEM and `simulate`: to put a CAD
 script (or any other simulator) in the loop, swap in a different prompt and
@@ -55,6 +56,7 @@ class Simulator:
         self.workers = workers
         self.log = log
         self.records: list[dict] = []
+        self.batches = 0
         self._t_last = time.time()
 
     @property
@@ -82,11 +84,13 @@ class Simulator:
         evals = evaluate_many(designs, workers=self.workers)
         batch = []
         for e in evals:
-            self.records.append({**vars(e), "t_propose": t_propose / len(evals), "rationale": rationale})
+            self.records.append({**vars(e), "t_propose": t_propose / len(evals), "batch": self.batches,
+                                 "rationale": rationale})
             batch.append(_summarise(e))
             best = self.best()
             self.log(f"[agent] {len(self.records):3d}/{self.budget}  ok={e.ok!s:5}  "
                      f"L/D={e.ld if e.ok else float('nan'):6.1f}  best={best['ld'] if best else float('nan'):6.1f}")
+        self.batches += 1
         self._t_last = time.time()
 
         best = self.best()

@@ -9,3 +9,6 @@ tools/*.deb
 
 # Per-run progress logs (the .json next to each holds the full record)
 results/runs/*.log
+
+# Per-run progress logs of the LLM agent (the .json next to each holds the full record)
+results/agent/*.log

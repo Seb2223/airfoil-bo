@@ -32,9 +32,15 @@ METHODS = {  # name -> (label, colour, trust region)
     "ens_ei_plain": ("Plain ensemble + EI, failure classifier", "#e87ba4", False),
     "gp_ei_tr": ("GP + EI, failure classifier, trust region", "#2a78d6", True),
     "ens_ei_tr": ("Bootstrapped ensemble + EI, failure classifier, trust region", "#eda100", True),
+    # Slot 7 (violet) rather than 6 (green): it stays further from aqua and blue
+    # under tritan simulation, and the LLM figure shows all three together.
+    "llm_high": ("Claude agent (scripts/agent.py)", "#4a3aa7", False),
 }
 MAIN_FIGURE = ["gp_ei", "gp_ei_impute", "random", "ens_ei", "ens_ei_plain"]
 TR_FIGURE = ["gp_ei", "gp_ei_tr", "ens_ei", "ens_ei_tr", "random"]
+LLM_FIGURE = ["gp_ei", "random", "llm_high"]
+# USD per million tokens (input, output, cache read, 5-minute cache write), list prices as of 2026-10.
+PRICES = {"claude-opus-5-5": (4.0, 20.0, 0.20, 5.0)}
 CALIBRATION_MODELS = {  # static study: the regression models behind gp_ei / ens_ei, plus the plain recipe
     "GP": "#2a78d6",
     "Deep ensemble (bootstrapped)": "#eda100",
@@ -53,11 +59,14 @@ plt.rcParams.update({
 })
 
 
-def load_runs():
+def load_runs(budget=100):
+    """BO runs from results/runs/ and LLM agent runs from results/agent/ with the given budget
+    (which leaves out the agent's short smoke-test runs)."""
     runs = {}
-    for path in sorted((RESULTS / "runs").glob("*.json")):
+    for path in sorted([*(RESULTS / "runs").glob("*.json"), *(RESULTS / "agent").glob("*.json")]):
         run = json.loads(path.read_text())
-        runs.setdefault(run["method"], []).append(run)
+        if run["budget"] == budget:
+            runs.setdefault(run["method"], []).append(run)
     return runs
 
 
@@ -66,14 +75,35 @@ def best_so_far(records):
     return np.where(np.isinf(best), np.nan, best)  # NaN until the first successful sim
 
 
+def curve(run):
+    """Best-so-far over the full budget. An agent that stops early leaves its unused
+    simulations flat: they are charged to it, as for any method that wastes them."""
+    c = best_so_far(run["records"])
+    if not len(c):
+        return np.full(run["budget"], np.nan)
+    return np.pad(c, (0, run["budget"] - len(c)), mode="edge")
+
+
+def repeat_share(runs_of_method, tol=1e-3):
+    """Share of simulations whose design is (to within tol per parameter) one the same run
+    already simulated. XFoil is deterministic, so each repeat is a wasted simulation."""
+    repeats, total = 0, 0
+    for run in runs_of_method:
+        U = np.array([r["u"] for r in run["records"]])
+        for i in range(1, len(U)):
+            repeats += bool((np.abs(U[:i] - U[i]).max(axis=1) < tol).any())
+        total += len(U)
+    return repeats / total if total else float("nan")
+
+
 def first_reaching(curve, level):
     hit = np.nonzero(curve >= level)[0]
     return hit[0] + 1 if len(hit) else None
 
 
-def corner_share(runs_of_method, n_init=10):
-    """Share of BO proposals with at least 5 of the 7 parameters at a bound of the unit cube."""
-    props = [r for run in runs_of_method for r in run["records"][n_init:]]
+def corner_share(runs_of_method):
+    """Share of proposals (after any initial design) with at least 5 of the 7 parameters at a bound of the unit cube."""
+    props = [r for run in runs_of_method for r in run["records"][run["n_init"]:]]
     at_bound = [np.sum(np.minimum(np.array(r["u"]), 1 - np.array(r["u"])) < 1e-3) for r in props]
     return float(np.mean(np.array(at_bound) >= 5)) if props else float("nan")
 
@@ -94,7 +124,7 @@ def plot_convergence(curves, methods, title, path, ref, naca, best_known, labels
         lo, hi = np.nanpercentile(c, [25, 75], axis=0)
         ax.fill_between(x, lo, hi, color=color, alpha=0.12, linewidth=0)
         ax.plot(x, med, color=color, linewidth=2, linestyle=(0, (5, 2)) if dashed else "-",
-                solid_capstyle="round", label=f"{label} ({len(c)} seeds)")
+                solid_capstyle="round", label=f"{label} ({len(c)} {'runs' if m.startswith('llm') else 'seeds'})")
     for level, text in [(ref["best"]["ld"] if ref else None, f"Differential evolution, {ref['n_evals'] if ref else 0:,} sims"),
                         (naca, "NACA 4412")]:
         if level:
@@ -118,14 +148,14 @@ def main():
     baselines = json.loads((RESULTS / "baselines.json").read_text()) if (RESULTS / "baselines.json").exists() else {}
     naca = baselines.get("NACA 4412", {}).get("ld")
 
-    curves = {m: np.array([best_so_far(r["records"]) for r in runs[m]]) for m in METHODS if m in runs}
-    all_records = [(m, rec) for m in runs for run in runs[m] for rec in run["records"] if rec["ok"]]
+    curves = {m: np.array([curve(r) for r in runs[m]]) for m in METHODS if m in runs}
+    all_records = [(m, rec) for m in curves for run in runs[m] for rec in run["records"] if rec["ok"]]
     best_m, best_rec = max(all_records, key=lambda mr: mr[1]["ld"])
     best_known = max(best_rec["ld"], ref["best"]["ld"] if ref else -np.inf)
 
     # ---- summary table -------------------------------------------------------
     random_final = np.nanmedian(curves["random"][:, -1]) if "random" in curves else None
-    lines = ["| Method | Median best L/D after 20 / 50 / 100 sims | Median gap to best known at 100 sims "
+    lines = ["| Method | Median best L/D after 10 / 20 / 50 / 100 sims | Median gap to best known at 100 sims "
              f"| Sims to match random search's 100-sim median ({random_final:.1f}) | Failed sims "
              "| Proposals at a corner | Time per proposal |",
              "|---|---|---|---|---|---|---|"]
@@ -133,7 +163,7 @@ def main():
         if m not in curves:
             continue
         c = curves[m]
-        at = " / ".join(f"{np.nanmedian(c[:, k - 1]):.1f}" for k in (20, 50, 100))
+        at = " / ".join(f"{np.nanmedian(c[:, k - 1]):.1f}" for k in (10, 20, 50, 100))
         gap = best_known - np.nanmedian(c[:, -1])
         match = [first_reaching(row, random_final) for row in c]
         match_med = np.median([n if n else np.inf for n in match])
@@ -152,6 +182,8 @@ def main():
             a, b = b, a
         p = mannwhitneyu(finals[a], finals[b], alternative="greater").pvalue
         lines.append(f"| {METHODS[a][0]} > {METHODS[b][0]} | {p:.2g} |")
+    if any(m.startswith("llm") for m in curves):
+        lines += llm_tables(runs, curves)
     table = "\n".join(lines)
     print(table)
     print(f"\nBest known L/D: {best_known:.1f}  (best from runs: {best_rec['ld']:.1f} by {best_m})")
@@ -171,6 +203,11 @@ def main():
             labels={"gp_ei": "GP, whole space", "gp_ei_tr": "GP, trust region",
                     "ens_ei": "Bootstrapped ensemble, whole space", "ens_ei_tr": "Bootstrapped ensemble, trust region"},
             subtitle="All BO methods: EI + failure classifier. Median over seeds, band = interquartile range.")
+    if "llm_high" in curves:
+        plot_convergence(
+            curves, LLM_FIGURE, "Claude agent vs GP-based BO, same 100-simulation budget",
+            RESULTS / "llm_vs_gp.png", ref, naca, best_known,
+            subtitle="Median over seeds / runs, band = interquartile range. Not an equal comparison: see README.")
 
     # ---- figure 2: best shape vs NACA 4412 ---------------------------------------
     shapes = [(f"Best found: {METHODS[best_m][0]} (L/D {best_rec['ld']:.1f})",
@@ -202,6 +239,38 @@ def main():
         cal = json.loads((RESULTS / "calibration.json").read_text())
         plot_calibration(cal)
         write_calibration_tables(cal)
+
+
+def llm_tables(runs, curves):
+    """Plateau and waste for the methods in the LLM comparison, plus what the agent runs cost."""
+    lines = ["", "Plateau and waste:", "",
+             "| Method | Median gain over sims 51-100 | Median sim where the final best was found "
+             "| Repeated designs | Mean unused sims |", "|---|---|---|---|---|"]
+    for m in LLM_FIGURE:
+        if m not in curves:
+            continue
+        c = curves[m]
+        gain = np.nanmedian(c[:, -1] - c[:, 49])
+        found = np.median([first_reaching(row, row[-1]) or len(row) for row in c])
+        unused = np.mean([run["budget"] - len(run["records"]) for run in runs[m]])
+        lines.append(f"| {METHODS[m][0]} | {gain:+.1f} | {found:.0f} | {repeat_share(runs[m]):.1%} | {unused:.1f} |")
+    for m in curves:
+        if not m.startswith("llm"):
+            continue
+        rs = runs[m]
+        models = sorted({r["model"] for r in rs})
+        keys = ("input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens")
+        tok = np.array([[r["usage"][k] for k in keys] for r in rs], dtype=float)
+        med = np.median(tok, axis=0)
+        price = PRICES.get(models[0]) if len(models) == 1 else None
+        cost = f", ${np.median(tok @ np.array(price)) / 1e6:.2f} at list prices" if price else ""
+        stops = ", ".join(f"{s} x{n}" for s, n in zip(*np.unique([str(r["stop_reason"]) for r in rs], return_counts=True)))
+        lines += ["", f"{METHODS[m][0]}: {len(rs)} runs, model {', '.join(models)}, "
+                      f"effort {', '.join(sorted({r['effort'] for r in rs}))}, stop reasons: {stops}. "
+                      f"Median per run: {med[[0, 2, 3]].sum():,.0f} input tokens ({med[2]:,.0f} of them cache reads), "
+                      f"{med[1]:,.0f} output tokens{cost}, {np.median([r['wall_time'] for r in rs]) / 60:.0f} min, "
+                      f"{np.median([r['records'][-1]['batch'] + 1 for r in rs if r['records']]):.0f} simulate calls."]
+    return lines
 
 
 def write_calibration_tables(cal):
